@@ -1,0 +1,767 @@
+package com.soundata.app
+
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import android.media.*
+import android.net.Uri
+import android.os.*
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.unit.dp
+import coil.compose.AsyncImage
+import com.example.soundata.ui.theme.DatasoundTheme
+import kotlinx.coroutines.*
+import okhttp3.*
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.asRequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.logging.HttpLoggingInterceptor
+import retrofit2.Retrofit
+import retrofit2.converter.gson.GsonConverterFactory
+import retrofit2.http.*
+import java.io.File
+import java.io.IOException
+import java.util.*
+import kotlin.math.*
+import androidx.activity.compose.setContent
+import kotlinx.coroutines.channels.Channel
+import android.content.Intent
+import android.os.Build
+import android.provider.Settings
+import android.provider.OpenableColumns
+import okhttp3.ResponseBody
+import retrofit2.Response
+import androidx.compose.material3.TextFieldDefaults
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.border
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.res.painterResource
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.platform.LocalContext
+
+data class UploadJob(
+    val id: String,
+    val text: String,
+    val fileUri: Uri?,
+    val completion: CompletableDeferred<Boolean> = CompletableDeferred()
+)
+
+data class UploadResponse(val status: String, val id: String)
+data class DataEntryResponse(val id: String, val text: String, val fileUrl: String?, val fileType: String?)
+
+interface ApiService {
+    @Multipart
+    @POST("protocol/upload")
+    suspend fun uploadData(
+        @Part("text") text: RequestBody,
+        @Part("id") id: RequestBody,
+        @Part file: MultipartBody.Part?
+    ): UploadResponse
+
+    @GET("protocol/get")
+    suspend fun getById(
+        @Query("id") id: String
+    ): DataEntryResponse
+
+    @Streaming
+    @GET("protocol/download")
+    suspend fun downloadFile(
+        @Query("id") id: String
+    ): Response<ResponseBody>
+}
+
+class MainActivity : ComponentActivity() {
+    private val sampleRate = 44100
+    private lateinit var apiService: ApiService
+    private val coroutineScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private var _uploadStatus = mutableStateOf<String?>(null)
+    private var _receivedData = mutableStateOf<DataEntryResponse?>(null)
+    private val receivedData: State<DataEntryResponse?> get() = _receivedData
+    private val uploadStatus: State<String?> get() = _uploadStatus
+
+    private var listeningJob: Job? = null
+    private val uploadQueue = Channel<UploadJob>(Channel.UNLIMITED)
+
+    private val charToFreq = mapOf(
+        'A' to 900.0, 'B' to 1000.0, 'C' to 1100.0, 'D' to 1200.0, 'E' to 1300.0,
+        'F' to 1400.0, 'G' to 1500.0, 'H' to 1600.0, 'I' to 1700.0, 'J' to 1800.0,
+        'K' to 1900.0, 'L' to 2000.0, 'M' to 2100.0, 'N' to 2200.0, 'O' to 2300.0,
+        'P' to 2400.0, 'Q' to 2500.0, 'R' to 2600.0, 'S' to 2700.0, 'T' to 2800.0,
+        'U' to 2900.0, 'V' to 3000.0, 'W' to 3100.0, 'X' to 3200.0, 'Y' to 3300.0,
+        'Z' to 3400.0,
+        '0' to 3500.0, '1' to 3600.0, '2' to 3700.0, '3' to 3800.0, '4' to 3900.0,
+        '5' to 4000.0, '6' to 4100.0, '7' to 4200.0, '8' to 4300.0, '9' to 4400.0
+    )
+
+    private fun startFloatingWidgetService() {
+        val intent = Intent(this, FloatingWidgetService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
+    }
+
+    private fun getFileSize(uri: Uri): Long {
+        contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+            if (sizeIndex != -1) {
+                cursor.moveToFirst()
+                return cursor.getLong(sizeIndex)
+            }
+        }
+        return -1
+    }
+
+    private val requestRecordAudioLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            startListening()
+        } else {
+            _uploadStatus.value = "Permesso microfono non concesso"
+        }
+    }
+
+    private val overlayPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        if (Settings.canDrawOverlays(this)) {
+            startFloatingWidgetService()
+        } else {
+            _uploadStatus.value = "Permesso overlay non concesso"
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        val logging = HttpLoggingInterceptor().apply { level = HttpLoggingInterceptor.Level.BODY }
+        val client = OkHttpClient.Builder()
+            .addInterceptor(logging)
+            .build()
+
+        val retrofit = Retrofit.Builder()
+            .baseUrl("https://main-7xi7.onrender.com")
+            .client(client)
+            .addConverterFactory(GsonConverterFactory.create())
+            .build()
+
+        apiService = retrofit.create(ApiService::class.java)
+
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestRecordAudioLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        } else {
+            startListening()
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            if (!Settings.canDrawOverlays(this)) {
+                val intent = Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:$packageName")
+                )
+                overlayPermissionLauncher.launch(intent)
+            } else {
+                startFloatingWidgetService()
+            }
+        } else {
+            startFloatingWidgetService()
+        }
+
+        coroutineScope.launch {
+            processUploadQueue()
+        }
+
+        setContent {
+            DatasoundTheme {
+                Surface(modifier = Modifier.fillMaxSize()) {
+                    AppUI()
+                }
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        listeningJob?.cancel()
+        coroutineScope.cancel()
+    }
+
+    private suspend fun processUploadQueue() {
+        for (job in uploadQueue) {
+            var attempts = 0
+            val maxRetries = 3
+            var success = false
+
+            while (attempts < maxRetries && !success) {
+                try {
+                    uploadData(job.id, job.text, job.fileUri)
+                    success = true
+                } catch (e: Exception) {
+                    attempts++
+                    delay(2000L)
+                }
+            }
+
+            if (!success) {
+                withContext(Dispatchers.Main) {
+                    _uploadStatus.value = "fallito dopo $maxRetries tentativi"
+                }
+            }
+
+            job.completion.complete(success)
+        }
+    }
+
+    private suspend fun uploadData(id: String, text: String, fileUri: Uri?) {
+        val textBody = text.toRequestBody("text/plain".toMediaTypeOrNull())
+        val idBody = id.toRequestBody("text/plain".toMediaTypeOrNull())
+
+        val filePart = fileUri?.let { uri ->
+            val file = copyUriToFile(uri)
+            val mimeType = contentResolver.getType(uri) ?: "*/*"
+            val requestFile = file.asRequestBody(mimeType.toMediaTypeOrNull())
+            MultipartBody.Part.createFormData("file", file.name, requestFile)
+        }
+
+        val response = apiService.uploadData(textBody, idBody, filePart)
+
+        withContext(Dispatchers.Main) {
+            _uploadStatus.value = "riuscito con id: ${response.id}"
+        }
+    }
+
+    @Composable
+    fun AppUI(isListening: Boolean = true) {
+        var inputText by remember { mutableStateOf("") }
+        var fileUri by remember { mutableStateOf<Uri?>(null) }
+        var fileName by remember { mutableStateOf<String?>(null) }
+        val uploadStatus by this@MainActivity.uploadStatus
+        val receivedData by this@MainActivity.receivedData
+        val coroutineScope = rememberCoroutineScope()
+        val scrollState = rememberScrollState()
+        val context = LocalContext.current
+
+        val filePickerLauncher = rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.GetContent()
+        ) { uri: Uri? ->
+            uri?.let {
+                val size = getFileSize(it)
+                if (size > 9 * 1024 * 1024) {
+                    _uploadStatus.value = "❌ File troppo grande: massimo 9 MB"
+                    fileUri = null
+                    fileName = null
+                } else {
+                    fileUri = it
+                    fileName = getFileNameFromUri(it)
+                    _uploadStatus.value = null
+                }
+            }
+        }
+
+        val downloadLauncher = rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.CreateDocument()
+        ) { uri ->
+            uri?.let { destinationUri ->
+                coroutineScope.launch {
+                    downloadFile(receivedData?.id ?: "", destinationUri)
+                }
+            }
+        }
+
+        LaunchedEffect(inputText, fileUri) {
+            val prefs = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
+            prefs.edit()
+                .putString("last_input_text", inputText)
+                .putString("last_file_uri", fileUri?.toString())
+                .apply()
+        }
+
+        val colors = MaterialTheme.colorScheme
+        val gradientBackground = Brush.linearGradient(
+            colors = listOf(Color(0xFFFF5722), Color(0xFFFF6F00)),
+            start = Offset(0f, 0f),
+            end = Offset(1000f, 1000f)
+        )
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(scrollState)
+                .background(brush = gradientBackground)
+                .padding(24.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Image(
+                    painter = painterResource(R.drawable.logo),
+                    contentDescription = "Logo",
+                    modifier = Modifier.size(48.dp).padding(end = 12.dp)
+                )
+                Text(
+                    text = "SounData",
+                    style = MaterialTheme.typography.headlineMedium.copy(
+                        fontWeight = FontWeight.ExtraBold,
+                        color = Color.White
+                    )
+                )
+            }
+
+            Box(modifier = Modifier.fillMaxWidth()) {
+                OutlinedTextField(
+                    value = inputText,
+                    onValueChange = { inputText = it },
+                    label = { Text("Inserisci testo", color = Color.White.copy(alpha = 0.8f)) },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = TextFieldDefaults.colors(
+                        focusedContainerColor = Color.Transparent,
+                        unfocusedContainerColor = Color.Transparent,
+                        focusedTextColor = Color.White,
+                        unfocusedTextColor = Color.White,
+                        focusedIndicatorColor = Color.White,
+                        unfocusedIndicatorColor = Color.White.copy(alpha = 0.5f),
+                        focusedLabelColor = Color.White,
+                        unfocusedLabelColor = Color.White.copy(alpha = 0.5f),
+                        cursorColor = Color.White
+                    ),
+                    shape = RoundedCornerShape(14.dp),
+                    singleLine = true
+                )
+                if (isListening) {
+                    Box(
+                        modifier = Modifier
+                            .size(14.dp)
+                            .background(Color(0xFF4CAF50), shape = CircleShape)
+                            .align(Alignment.TopEnd)
+                            .border(1.dp, Color.White, CircleShape)
+                            .offset(x = (-8).dp, y = 8.dp)
+                    )
+                }
+            }
+
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(
+                    onClick = { filePickerLauncher.launch("*/*") },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = colors.secondary,
+                        contentColor = Color.White
+                    ),
+                    shape = RoundedCornerShape(14.dp),
+                    elevation = ButtonDefaults.buttonElevation(8.dp)
+                ) {
+                    Text(
+                        text = if (fileUri == null) "SELECT FILE" else "File selezionato: ${fileName ?: "Sconosciuto"}",
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+
+                Button(
+                    onClick = {
+                        coroutineScope.launch {
+                            val uniqueId = UUID.randomUUID().toString().take(5).uppercase()
+                            val job = UploadJob(uniqueId, inputText, fileUri)
+                            uploadQueue.send(job)
+                            val success = job.completion.await()
+
+                            if (success) {
+                                delay(500)
+                                playIdSequence(uniqueId)
+                                _uploadStatus.value = "✅ Dati trasmessi, in attesa di ricezione..."
+                            } else {
+                                _uploadStatus.value = "❌ Upload fallito"
+                            }
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = colors.primary,
+                        contentColor = Color.White
+                    ),
+                    shape = RoundedCornerShape(14.dp),
+                    elevation = ButtonDefaults.buttonElevation(8.dp)
+                ) {
+                    Text("BROADCAST DATA", fontWeight = FontWeight.Bold)
+                }
+            }
+
+            uploadStatus?.let { status ->
+                Text(
+                    text = status,
+                    color = when {
+                        status.contains("❌") -> Color(0xFFEF5350)
+                        status.contains("✅") -> Color(0xFF66BB6A)
+                        else -> Color.White
+                    },
+                    style = MaterialTheme.typography.bodyLarge.copy(
+                        fontWeight = FontWeight.Medium
+                    ),
+                    modifier = Modifier.padding(vertical = 4.dp)
+                )
+            }
+
+            receivedData?.let { data ->
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    when {
+                        data.fileType?.startsWith("image/") == true -> {
+                            data.fileUrl?.let { fileUrl ->
+                                Column(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalAlignment = Alignment.CenterHorizontally
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(vertical = 8.dp),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .shadow(
+                                                    elevation = 12.dp,
+                                                    shape = RoundedCornerShape(8.dp),
+                                                    clip = true
+                                                )
+                                                .background(Color(0x20FFFFFF))
+                                        ) {
+                                            AsyncImage(
+                                                model = fileUrl,
+                                                contentDescription = "Immagine ricevuta",
+                                                contentScale = ContentScale.Fit,
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .wrapContentHeight()
+                                            )
+                                        }
+                                    }
+
+                                    Button(
+                                        onClick = {
+                                            val extension = when (data.fileType) {
+                                                "image/png" -> "png"
+                                                "image/jpeg" -> "jpg"
+                                                "image/gif" -> "gif"
+                                                else -> "img"
+                                            }
+                                            val suggestedName = "image_${data.id}.$extension"
+                                            downloadLauncher.launch(suggestedName)
+                                        },
+                                        modifier = Modifier.fillMaxWidth(0.7f),
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = colors.secondary,
+                                            contentColor = Color.White
+                                        ),
+                                        shape = RoundedCornerShape(14.dp),
+                                        elevation = ButtonDefaults.buttonElevation(6.dp)
+                                    ) {
+                                        Text("Scarica immagine", fontWeight = FontWeight.Medium)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Column(modifier = Modifier.padding(top = 8.dp)) {
+                        Text(
+                            text = "TESTO RICEVUTO:",
+                            style = MaterialTheme.typography.titleMedium.copy(
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White
+                            ),
+                            modifier = Modifier.padding(bottom = 4.dp)
+                        )
+
+                        Text(
+                            text = data.text,
+                            style = MaterialTheme.typography.bodyLarge.copy(
+                                color = Color.White,
+                                fontWeight = FontWeight.Normal
+                            ),
+                            modifier = Modifier.padding(bottom = 12.dp)
+                        )
+
+                        when {
+                            data.fileUrl != null && !data.fileType?.startsWith("image/")!! -> {
+                                Button(
+                                    onClick = {
+                                        val extension = when (data.fileType) {
+                                            "application/pdf" -> "pdf"
+                                            "image/*" -> "jpg"
+                                            else -> "dat"
+                                        }
+                                        val suggestedName = "file_${data.id}.$extension"
+                                        downloadLauncher.launch(suggestedName)
+                                    },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = colors.secondary,
+                                        contentColor = Color.White
+                                    ),
+                                    shape = RoundedCornerShape(14.dp),
+                                    elevation = ButtonDefaults.buttonElevation(6.dp)
+                                ) {
+                                    Text(
+                                        "Scarica file (${data.fileType ?: "tipo sconosciuto"})",
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun getFileNameFromUri(uri: Uri): String? {
+        return when (uri.scheme) {
+            "content" -> contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) cursor.getString(cursor.getColumnIndexOrThrow(OpenableColumns.DISPLAY_NAME))
+                else null
+            }
+            "file" -> uri.lastPathSegment
+            else -> null
+        }
+    }
+
+    private suspend fun downloadFile(id: String, destinationUri: Uri) {
+        try {
+            val response = apiService.downloadFile(id)
+            if (response.isSuccessful) {
+                response.body()?.let { body ->
+                    contentResolver.openOutputStream(destinationUri)?.use { outputStream ->
+                        body.byteStream().use { inputStream ->
+                            inputStream.copyTo(outputStream)
+                            _uploadStatus.value = "File scaricato con successo"
+                        }
+                    }
+                } ?: run {
+                    _uploadStatus.value = "Nessun contenuto nel file"
+                }
+            } else {
+                _uploadStatus.value = "Errore durante il download: ${response.message()}"
+            }
+        } catch (e: Exception) {
+            _uploadStatus.value = "Errore durante il download: ${e.message}"
+        }
+    }
+
+    private suspend fun playIdSequence(id: String) = withContext(Dispatchers.IO) {
+        val durationMs = 200
+        val toneFrequencies = id.mapNotNull { charToFreq[it] }
+        val samplesPerTone = (sampleRate * durationMs / 1000.0).toInt()
+        val bufferSize = AudioTrack.getMinBufferSize(
+            sampleRate,
+            AudioFormat.CHANNEL_OUT_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+
+        val audioTrack = AudioTrack(
+            AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                .build(),
+            AudioFormat.Builder()
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setSampleRate(sampleRate)
+                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                .build(),
+            bufferSize,
+            AudioTrack.MODE_STREAM,
+            AudioManager.AUDIO_SESSION_ID_GENERATE
+        )
+
+        audioTrack.play()
+
+        for (freq in toneFrequencies) {
+            val buffer = ByteArray(samplesPerTone * 2)
+            for (i in 0 until samplesPerTone) {
+                val sample = sin(2 * PI * freq * i / sampleRate)
+                val volume = 0.5  // 70%
+                val value = (sample * Short.MAX_VALUE * volume).toInt()
+
+                buffer[i * 2] = (value and 0xFF).toByte()
+                buffer[i * 2 + 1] = ((value shr 8) and 0xFF).toByte()
+            }
+            audioTrack.write(buffer, 0, buffer.size)
+        }
+
+        audioTrack.stop()
+        audioTrack.release()
+    }
+
+    private fun startListening() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            _uploadStatus.value = "Permesso microfono non concesso"
+            return
+        }
+
+        val validFrequencies = charToFreq.values
+        val minValidFreq = validFrequencies.minOrNull() ?: 840.0
+        val maxValidFreq = validFrequencies.maxOrNull() ?: 4460.0
+        val toleranceHz = 50.0
+
+        fun findClosestCharWithTolerance(freq: Double): Char? {
+            return charToFreq.entries.minByOrNull { abs(it.value - freq) }?.takeIf {
+                abs(it.value - freq) <= toleranceHz
+            }?.key
+        }
+
+        listeningJob?.cancel()
+        listeningJob = coroutineScope.launch(Dispatchers.Default) {
+            val minBufferSize = AudioRecord.getMinBufferSize(
+                sampleRate,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+            )
+
+            val audioRecord = AudioRecord(
+                MediaRecorder.AudioSource.MIC,
+                sampleRate,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                minBufferSize
+            )
+
+            val buffer = ShortArray(minBufferSize)
+            audioRecord.startRecording()
+
+            val detectedChars = mutableListOf<Char>()
+            var lastDetectionTime = System.currentTimeMillis()
+
+            try {
+                while (isActive) {
+                    val read = audioRecord.read(buffer, 0, minBufferSize)
+                    if (read > 0) {
+                        val peakFreq = detectPeakFrequency(buffer, read)
+
+                        if (peakFreq != null && peakFreq in minValidFreq..maxValidFreq) {
+                            val matchedChar = findClosestCharWithTolerance(peakFreq)
+                            val now = System.currentTimeMillis()
+
+                            if (matchedChar != null) {
+                                if (now - lastDetectionTime >= 180) {
+                                    detectedChars.add(matchedChar)
+                                    lastDetectionTime = now
+                                }
+
+                                if (detectedChars.size == 5) {
+                                    val detectedId = detectedChars.joinToString("")
+                                    _uploadStatus.value = "🔊 ID rilevato: $detectedId"
+
+                                    try {
+                                        val data = apiService.getById(detectedId)
+                                        _receivedData.value = data
+                                        _uploadStatus.value = "✅ Dati ricevuti con successo"
+                                    } catch (e: Exception) {
+                                        _uploadStatus.value = "❌ Errore recupero dati: ${e.message}"
+                                    }
+
+                                    detectedChars.clear()
+                                }
+                            } else {
+                                detectedChars.clear()
+                            }
+                        } else {
+                            detectedChars.clear()
+                        }
+                    }
+                }
+            } finally {
+                audioRecord.stop()
+                audioRecord.release()
+            }
+        }
+    }
+
+    private fun detectPeakFrequency(buffer: ShortArray, length: Int): Double? {
+        val n = length
+        val fftSize = 1 shl (ceil(log2(n.toDouble())).toInt())
+        val windowed = DoubleArray(fftSize) { i ->
+            if (i < n) buffer[i].toDouble() * (0.5 * (1 - cos(2 * PI * i / (n - 1))))
+            else 0.0
+        }
+
+        val fftResult = fft(windowed)
+        val magnitudes = fftResult.map { it.abs() }
+
+        return magnitudes.subList(0, fftSize / 2)
+            .withIndex()
+            .maxByOrNull { it.value }
+            ?.let { maxIndex ->
+                maxIndex.index * (sampleRate.toDouble() / fftSize)
+            }
+    }
+
+    private fun fft(input: DoubleArray): Array<Complex> {
+        val n = input.size
+        if (n == 1) return arrayOf(Complex(input[0], 0.0))
+
+        val even = DoubleArray(n / 2) { input[2 * it] }
+        val odd = DoubleArray(n / 2) { input[2 * it + 1] }
+
+        val fftEven = fft(even)
+        val fftOdd = fft(odd)
+
+        return Array(n) { k ->
+            if (k < n / 2) {
+                val twiddle = Complex.polar(1.0, -2 * PI * k / n) * fftOdd[k]
+                fftEven[k] + twiddle
+            } else {
+                val twiddle = Complex.polar(1.0, -2 * PI * (k - n / 2) / n) * fftOdd[k - n / 2]
+                fftEven[k - n / 2] - twiddle
+            }
+        }
+    }
+
+    private fun copyUriToFile(uri: Uri): File {
+        val inputStream = contentResolver.openInputStream(uri) ?: throw IOException("Impossibile aprire uri")
+        val tempFile = File(cacheDir, "upload_${System.currentTimeMillis()}.tmp")
+        inputStream.use { input ->
+            tempFile.outputStream().use { output ->
+                input.copyTo(output)
+            }
+        }
+        return tempFile
+    }
+
+    private data class Complex(val re: Double, val im: Double) {
+        operator fun plus(other: Complex) = Complex(re + other.re, im + other.im)
+        operator fun minus(other: Complex) = Complex(re - other.re, im - other.im)
+        operator fun times(other: Complex) = Complex(
+            re * other.re - im * other.im,
+            re * other.im + im * other.re
+        )
+
+        fun abs() = sqrt(re * re + im * im)
+
+        companion object {
+            fun polar(r: Double, theta: Double) = Complex(r * cos(theta), r * sin(theta))
+        }
+    }
+}

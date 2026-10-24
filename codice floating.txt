@@ -1,0 +1,353 @@
+package com.soundata.app
+
+import android.app.*
+import android.content.*
+import android.graphics.PixelFormat
+import android.media.*
+import android.net.Uri
+import android.os.*
+import android.view.*
+import android.widget.ImageView
+import androidx.core.app.NotificationCompat
+import kotlinx.coroutines.*
+import kotlin.math.PI
+import kotlin.math.sin
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.MultipartBody
+import okhttp3.OkHttpClient
+import okhttp3.RequestBody.Companion.asRequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.logging.HttpLoggingInterceptor
+import retrofit2.Retrofit
+import retrofit2.converter.gson.GsonConverterFactory
+import java.io.File
+import java.io.IOException
+import kotlin.math.abs
+import retrofit2.http.*
+import okhttp3.RequestBody
+import android.view.LayoutInflater
+import android.view.View
+
+class FloatingWidgetService : Service() {
+
+    private lateinit var windowManager: WindowManager
+    private lateinit var floatingView: View
+    private lateinit var params: WindowManager.LayoutParams
+
+    private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+
+    private val sampleRate = 44100
+    private val charToFreq = mapOf(
+        'A' to 900.0, 'B' to 1000.0, 'C' to 1100.0, 'D' to 1200.0, 'E' to 1300.0,
+        'F' to 1400.0, 'G' to 1500.0, 'H' to 1600.0, 'I' to 1700.0, 'J' to 1800.0,
+        'K' to 1900.0, 'L' to 2000.0, 'M' to 2100.0, 'N' to 2200.0, 'O' to 2300.0,
+        'P' to 2400.0, 'Q' to 2500.0, 'R' to 2600.0, 'S' to 2700.0, 'T' to 2800.0,
+        'U' to 2900.0, 'V' to 3000.0, 'W' to 3100.0, 'X' to 3200.0, 'Y' to 3300.0,
+        'Z' to 3400.0,
+        '0' to 3500.0, '1' to 3600.0, '2' to 3700.0, '3' to 3800.0, '4' to 3900.0,
+        '5' to 4000.0, '6' to 4100.0, '7' to 4200.0, '8' to 4300.0, '9' to 4400.0
+    )
+
+    private val receiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == "com.example.datasound.WIDGET_UPLOAD") {
+                val id = intent.getStringExtra("id") ?: return
+                serviceScope.launch {
+                    val data = fetchDataFromServer(id)
+                    showDataNotification(data)
+                }
+            }
+        }
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onCreate() {
+        super.onCreate()
+
+        val filter = IntentFilter("com.example.datasound.WIDGET_UPLOAD")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+        }
+        val inflater = LayoutInflater.from(this)
+        floatingView = inflater.inflate(R.layout.layout_floating_widget, null as ViewGroup?, false)
+
+        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        else
+            @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
+
+        val prefs = getSharedPreferences("widget_prefs", Context.MODE_PRIVATE)
+        val savedX = prefs.getInt("pos_x", 0)
+        val savedY = prefs.getInt("pos_y", 970)
+
+        params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            type,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        )
+
+        params.gravity = Gravity.TOP or Gravity.START
+        params.x = savedX
+        params.y = savedY
+
+        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        windowManager.addView(floatingView, params)
+
+        val widgetButton = floatingView.findViewById<ImageView>(R.id.floating_button)
+        widgetButton.setOnTouchListener(FloatingOnTouchListener())
+
+        startForegroundService()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        unregisterReceiver(receiver)
+        if (::floatingView.isInitialized) windowManager.removeView(floatingView)
+        serviceScope.cancel()
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        stopSelf()
+    }
+
+    private fun startForegroundService() {
+        val channelId = "FLOATING_WIDGET_CHANNEL"
+        val channelName = "Floating Widget Service"
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                channelId,
+                channelName,
+                NotificationManager.IMPORTANCE_MIN
+            )
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.createNotificationChannel(channel)
+        }
+
+        val notification = NotificationCompat.Builder(this, channelId)
+            .setOngoing(true)
+            .setContentTitle("Servizio Widget Fluttuante in esecuzione")
+            .setSmallIcon(R.drawable.ic_play)
+            .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setCategory(Notification.CATEGORY_SERVICE)
+            .build()
+
+        startForeground(101, notification)
+    }
+
+    private fun generateId(): String {
+        val allowedChars = ('A'..'Z') + ('0'..'9')
+        return (1..5).map { allowedChars.random() }.joinToString("")
+    }
+
+    private suspend fun sendFromWidget(id: String) {
+        val context = applicationContext
+        val prefs = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
+        val text = prefs.getString("last_input_text", "") ?: ""
+        val fileUriString = prefs.getString("last_file_uri", null)
+
+        try {
+            val logging = HttpLoggingInterceptor().apply { level = HttpLoggingInterceptor.Level.BODY }
+            val client = OkHttpClient.Builder().addInterceptor(logging).build()
+
+            val retrofit = Retrofit.Builder()
+                .baseUrl("https://main-7xi7.onrender.com")
+                .client(client)
+                .addConverterFactory(GsonConverterFactory.create())
+                .build()
+
+            val apiService = retrofit.create(ApiService::class.java)
+
+            val textBody = text.toRequestBody("text/plain".toMediaTypeOrNull())
+            val idBody = id.toRequestBody("text/plain".toMediaTypeOrNull())
+
+            val filePart = fileUriString?.let { uriString ->
+                val uri = Uri.parse(uriString)
+                try {
+                    val file = copyUriToFile(uri)
+                    val mimeType = contentResolver.getType(uri) ?: "*/*"
+                    val requestFile = file.asRequestBody(mimeType.toMediaTypeOrNull())
+                    MultipartBody.Part.createFormData("file", file.name, requestFile)
+                } catch (e: Exception) {
+                    showDataNotification("Errore con il file: ${e.message}")
+                    null
+                }
+            }
+
+            val response = apiService.uploadData(textBody, idBody, filePart)
+            showDataNotification("Upload riuscito con ID: ${response.id}")
+        } catch (e: Exception) {
+            showDataNotification("Errore upload: ${e.message}")
+        }
+    }
+
+    private fun copyUriToFile(uri: Uri): File {
+        val inputStream = contentResolver.openInputStream(uri) ?: throw IOException("Impossibile aprire uri")
+        val tempFile = File(cacheDir, "upload_${System.currentTimeMillis()}.tmp")
+        inputStream.use { input ->
+            tempFile.outputStream().use { output ->
+                input.copyTo(output)
+            }
+        }
+        return tempFile
+    }
+
+
+    private suspend fun playIdSequence(id: String) = withContext(Dispatchers.IO) {
+        val durationMs = 200
+        val toneFrequencies = id.mapNotNull { charToFreq[it] }
+        val samplesPerTone = (sampleRate * durationMs / 1000.0).toInt()
+        val bufferSize = AudioTrack.getMinBufferSize(
+            sampleRate,
+            AudioFormat.CHANNEL_OUT_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+
+        val audioTrack = AudioTrack(
+            AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                .build(),
+            AudioFormat.Builder()
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setSampleRate(sampleRate)
+                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                .build(),
+            bufferSize,
+            AudioTrack.MODE_STREAM,
+            AudioManager.AUDIO_SESSION_ID_GENERATE
+        )
+
+        audioTrack.play()
+
+        for (freq in toneFrequencies) {
+            val buffer = ByteArray(samplesPerTone * 2)
+            for (i in 0 until samplesPerTone) {
+                val sample = sin(2 * PI * freq * i / sampleRate)
+                val volume = 0.5  // 70%
+                val value = (sample * Short.MAX_VALUE * volume).toInt()
+
+                buffer[i * 2] = (value and 0xFF).toByte()
+                buffer[i * 2 + 1] = ((value shr 8) and 0xFF).toByte()
+            }
+            audioTrack.write(buffer, 0, buffer.size)
+        }
+
+        audioTrack.stop()
+        audioTrack.release()
+    }
+
+    private suspend fun fetchDataFromServer(id: String): String {
+        try {
+            val logging = HttpLoggingInterceptor().apply { level = HttpLoggingInterceptor.Level.BODY }
+            val client = OkHttpClient.Builder().addInterceptor(logging).build()
+
+            val retrofit = Retrofit.Builder()
+                .baseUrl("https://main-7xi7.onrender.com")
+                .client(client)
+                .addConverterFactory(GsonConverterFactory.create())
+                .build()
+
+            val apiService = retrofit.create(ApiService::class.java)
+            val data = apiService.getById(id)
+
+            return "Dati ricevuti:\nTesto: ${data.text}\nTipo file: ${data.fileType ?: "Nessun file"}"
+        } catch (e: Exception) {
+            return "Errore nel recupero dati: ${e.message}"
+        }
+    }
+
+    private fun showDataNotification(data: String) {
+        val channelId = "DATA_NOTIFICATION_CHANNEL"
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                channelId,
+                "Data Notifications",
+                NotificationManager.IMPORTANCE_HIGH
+            )
+            manager.createNotificationChannel(channel)
+        }
+
+        val notification = NotificationCompat.Builder(this, channelId)
+            .setContentTitle("Dati Ricevuti")
+            .setContentText(data)
+            .setSmallIcon(R.drawable.ic_play)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .build()
+
+        manager.notify(202, notification)
+    }
+
+    private inner class FloatingOnTouchListener : View.OnTouchListener {
+        private var initialX = 0
+        private var initialY = 0
+        private var initialTouchX = 0f
+        private var initialTouchY = 0f
+
+        override fun onTouch(v: View?, event: MotionEvent): Boolean {
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    initialX = params.x
+                    initialY = params.y
+                    initialTouchX = event.rawX
+                    initialTouchY = event.rawY
+                    return true
+                }
+
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = (event.rawX - initialTouchX).toInt()
+                    val dy = (event.rawY - initialTouchY).toInt()
+                    params.x = initialX + dx
+                    params.y = initialY + dy
+                    windowManager.updateViewLayout(floatingView, params)
+                    return true
+                }
+
+                MotionEvent.ACTION_UP -> {
+                    getSharedPreferences("widget_prefs", Context.MODE_PRIVATE)
+                        .edit()
+                        .putInt("pos_x", params.x)
+                        .putInt("pos_y", params.y)
+                        .apply()
+
+                    val diffX = (event.rawX - initialTouchX).toInt()
+                    val diffY = (event.rawY - initialTouchY).toInt()
+                    if (abs(diffX) < 5 && abs(diffY) < 5) {
+                        serviceScope.launch {
+                            val id = generateId()
+                            sendFromWidget(id)
+                            playIdSequence(id)
+                        }
+                    }
+                    return true
+                }
+            }
+            return false
+        }
+    }
+
+    interface ApiService {
+        @Multipart
+        @POST("protocol/upload")
+        suspend fun uploadData(
+            @Part("text") text: RequestBody,
+            @Part("id") id: RequestBody,
+            @Part file: MultipartBody.Part?
+        ): UploadResponse
+
+        @GET("protocol/get")
+        suspend fun getById(
+            @Query("id") id: String
+        ): DataEntryResponse
+    }
+
+    data class UploadResponse(val status: String, val id: String)
+    data class DataEntryResponse(val id: String, val text: String, val fileUrl: String?, val fileType: String?)
+}
