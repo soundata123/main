@@ -45,7 +45,7 @@ async def cleanup_old_entries():
     while True:
         try:
             now = datetime.now()
-            one_hour_ago = now - timedelta(hours=168)
+            one_hour_ago = now - timedelta(hours=1)
             to_delete = []
             
             for id, entry in db.items():
